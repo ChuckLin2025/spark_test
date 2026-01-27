@@ -319,30 +319,12 @@ class CoarseGrainedExecutorBackendSuite extends SparkFunSuite
       val executor = backend.executor
       // Mock the executor.
       val threadPool = ThreadUtils.newDaemonFixedThreadPool(1, "test-executor")
-      val runningTasks = spy[ConcurrentHashMap[Long, Executor#TaskRunner]](
-        new ConcurrentHashMap[Long, Executor#TaskRunner])
-
-      // Use reflection to set the val fields since Mockito can't mock val fields properly
-      val executorClass = classOf[Executor]
-      val threadPoolField = executorClass.getDeclaredField("threadPool")
-      threadPoolField.setAccessible(true)
-      threadPoolField.set(executor, threadPool)
-
-      val runningTasksField = executorClass.getDeclaredField("runningTasks")
-      runningTasksField.setAccessible(true)
-      runningTasksField.set(executor, runningTasks)
-
-      val confField = executorClass.getDeclaredField("conf")
-      confField.setAccessible(true)
-      confField.set(executor, conf)
-
-      val envField = executorClass.getDeclaredField("org$apache$spark$executor$Executor$$env")
-      envField.setAccessible(true)
-      envField.set(executor, env)
-
-      val killMarksField = executorClass.getDeclaredField("killMarks")
-      killMarksField.setAccessible(true)
-      killMarksField.set(executor, new ConcurrentHashMap[Long, (Boolean, String, Long)])
+      when(executor.threadPool).thenReturn(threadPool)
+      val runningTasks = new ConcurrentHashMap[Long, Executor#TaskRunner]
+      when(executor.runningTasks).thenAnswer(_ => runningTasks)
+      val killMarks = spy(new ConcurrentHashMap[Long, Long])
+      when(executor.killMarks).thenAnswer(_ => killMarks)
+      when(executor.conf).thenReturn(conf)
 
       def getFakeTaskRunner(taskDescription: TaskDescription): Executor#TaskRunner = {
         new executor.TaskRunner(backend, taskDescription, None) {
@@ -437,6 +419,8 @@ class CoarseGrainedExecutorBackendSuite extends SparkFunSuite
       val runningTasks = spy[ConcurrentHashMap[Long, Executor#TaskRunner]](
         new ConcurrentHashMap[Long, Executor#TaskRunner])
       when(executor.runningTasks).thenAnswer(_ => runningTasks)
+      val killMarks = spy(new ConcurrentHashMap[Long, Long])
+      when(executor.killMarks).thenAnswer(_ => killMarks)
       when(executor.conf).thenReturn(conf)
 
       // We don't really verify the data, just pass it around.
@@ -529,6 +513,8 @@ class CoarseGrainedExecutorBackendSuite extends SparkFunSuite
       val runningTasks = spy[ConcurrentHashMap[Long, Executor#TaskRunner]](
         new ConcurrentHashMap[Long, Executor#TaskRunner])
       when(executor.runningTasks).thenAnswer(_ => runningTasks)
+      val killMarks = spy(new ConcurrentHashMap[Long, Long])
+      when(executor.killMarks).thenAnswer(_ => killMarks)
       when(executor.conf).thenReturn(conf)
 
       // We don't really verify the data, just pass it around.

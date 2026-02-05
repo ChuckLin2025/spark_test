@@ -899,6 +899,7 @@ private[spark] class MapOutputTrackerMaster(
     override def run(): Unit = {
       try {
         while (true) {
+          var context: RpcCallContext = null
           try {
             val data = mapOutputTrackerMasterMessages.take()
             if (data == PoisonPill) {
@@ -908,29 +909,25 @@ private[spark] class MapOutputTrackerMaster(
             }
 
             data match {
-              case GetMapOutputMessage(shuffleId, validationParams, context) =>
-                try {
-                  handleStatusMessage(shuffleId, validationParams, context, needMergeOutput = false)
-                } catch {
-                  case NonFatal(e) =>
-                    logError(log"${MDC(ERROR, e.getMessage)}", e)
-                    context.sendFailure(e)
-                }
-              case GetMapAndMergeOutputMessage(shuffleId, validationParams, context) =>
-                try {
-                  handleStatusMessage(shuffleId, validationParams, context, needMergeOutput = true)
-                } catch {
-                  case NonFatal(e) =>
-                    logError(log"${MDC(ERROR, e.getMessage)}", e)
-                    context.sendFailure(e)
-                }
-              case GetShufflePushMergersMessage(shuffleId, context) =>
+              case GetMapOutputMessage(shuffleId, validationParams, ctx) =>
+                context = ctx
+                handleStatusMessage(shuffleId, validationParams, ctx, needMergeOutput = false)
+              case GetMapAndMergeOutputMessage(shuffleId, validationParams, ctx) =>
+                context = ctx
+                handleStatusMessage(shuffleId, validationParams, ctx, needMergeOutput = true)
+              case GetShufflePushMergersMessage(shuffleId, ctx) =>
+                context = ctx
                 logDebug(s"Handling request to send shuffle push merger locations for shuffle" +
-                  s" $shuffleId to ${context.senderAddress.hostPort}")
-                context.reply(shuffleStatuses.get(shuffleId).map(_.getShufflePushMergerLocations)
+                  s" $shuffleId to ${ctx.senderAddress.hostPort}")
+                ctx.reply(shuffleStatuses.get(shuffleId).map(_.getShufflePushMergerLocations)
                   .getOrElse(Seq.empty[BlockManagerId]))
             }
           } catch {
+            case e: MetadataFetchFailedException =>
+              logError(log"${MDC(ERROR, e.getMessage)}", e)
+              if (context != null) {
+                context.sendFailure(e)
+              }
             case NonFatal(e) => logError(log"${MDC(ERROR, e.getMessage)}", e)
           }
         }

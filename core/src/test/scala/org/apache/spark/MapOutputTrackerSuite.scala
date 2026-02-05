@@ -198,7 +198,8 @@ class MapOutputTrackerSuite extends SparkFunSuite with LocalSparkContext {
     val senderAddress = RpcAddress("localhost", 12345)
     val rpcCallContext = mock(classOf[RpcCallContext])
     when(rpcCallContext.senderAddress).thenReturn(senderAddress)
-    masterEndpoint.receiveAndReply(rpcCallContext)(GetMapOutputStatuses(10))
+    val msg = GetMapOutputStatuses(10, ValidationParams.skipValidation)
+    masterEndpoint.receiveAndReply(rpcCallContext)(msg)
     // Default size for broadcast in this testsuite is set to -1 so should not cause broadcast
     // to be used.
     verify(rpcCallContext, timeout(30000)).reply(any())
@@ -277,7 +278,8 @@ class MapOutputTrackerSuite extends SparkFunSuite with LocalSparkContext {
       val senderAddress = RpcAddress("localhost", 12345)
       val rpcCallContext = mock(classOf[RpcCallContext])
       when(rpcCallContext.senderAddress).thenReturn(senderAddress)
-      masterEndpoint.receiveAndReply(rpcCallContext)(GetMapOutputStatuses(20))
+      val msg = GetMapOutputStatuses(20, ValidationParams.skipValidation)
+      masterEndpoint.receiveAndReply(rpcCallContext)(msg)
       // should succeed since majority of data is broadcast and actual serialized
       // message size is small
       verify(rpcCallContext, timeout(30000)).reply(any())
@@ -588,7 +590,7 @@ class MapOutputTrackerSuite extends SparkFunSuite with LocalSparkContext {
         mapWorkerRpcEnv.setupEndpointRef(rpcEnv.address, MapOutputTracker.ENDPOINT_NAME)
 
       val fetchedBytes = mapWorkerTracker.trackerEndpoint
-        .askSync[Array[Byte]](GetMapOutputStatuses(20))
+        .askSync[Array[Byte]](GetMapOutputStatuses(20, ValidationParams.skipValidation))
       assert(fetchedBytes(0) == 1)
 
       // Normally `unregisterMapOutput` triggers the destroy of broadcasted value.
@@ -636,8 +638,9 @@ class MapOutputTrackerSuite extends SparkFunSuite with LocalSparkContext {
       mapWorkerTracker.trackerEndpoint =
         mapWorkerRpcEnv.setupEndpointRef(rpcEnv.address, MapOutputTracker.ENDPOINT_NAME)
 
+      val msg = GetMapAndMergeResultStatuses(20, ValidationParams.skipValidation)
       val fetchedBytes = mapWorkerTracker.trackerEndpoint
-        .askSync[(Array[Byte], Array[Byte])](GetMapAndMergeResultStatuses(20))
+        .askSync[(Array[Byte], Array[Byte])](msg)
       assert(masterTracker.getNumAvailableMergeResults(20) == 1)
       assert(masterTracker.getNumAvailableOutputs(20) == 100)
 

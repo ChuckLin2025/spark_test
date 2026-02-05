@@ -423,7 +423,7 @@ private class ShuffleStatus(
     if (_numAvailableMapOutputs < numPartitions) {
       throw new MetadataFetchFailedException(shuffleId, -1,
         s"Missing map outputs for shuffle $shuffleId: " +
-          s"expected $numPartitions, available $_numAvailableMapOutputs")
+          s"expected $numPartitions, available ${_numAvailableMapOutputs}")
     }
   }
 
@@ -669,7 +669,14 @@ private[spark] abstract class MapOutputTracker(conf: SparkConf) extends Logging 
     } catch {
       case e: Exception =>
         logError("Error communicating with MapOutputTracker", e)
-        throw new SparkException("Error communicating with MapOutputTracker", e)
+        // Propagate MetadataFetchFailedException from server-side validation directly,
+        // since it already extends FetchFailedException
+        e.getCause match {
+          case mffe: MetadataFetchFailedException =>
+            throw mffe
+          case _ =>
+            throw new SparkException("Error communicating with MapOutputTracker", e)
+        }
     }
   }
 
@@ -902,9 +909,21 @@ private[spark] class MapOutputTrackerMaster(
 
             data match {
               case GetMapOutputMessage(shuffleId, validationParams, context) =>
-                handleStatusMessage(shuffleId, validationParams, context, needMergeOutput = false)
+                try {
+                  handleStatusMessage(shuffleId, validationParams, context, needMergeOutput = false)
+                } catch {
+                  case NonFatal(e) =>
+                    logError(log"${MDC(ERROR, e.getMessage)}", e)
+                    context.sendFailure(e)
+                }
               case GetMapAndMergeOutputMessage(shuffleId, validationParams, context) =>
-                handleStatusMessage(shuffleId, validationParams, context, needMergeOutput = true)
+                try {
+                  handleStatusMessage(shuffleId, validationParams, context, needMergeOutput = true)
+                } catch {
+                  case NonFatal(e) =>
+                    logError(log"${MDC(ERROR, e.getMessage)}", e)
+                    context.sendFailure(e)
+                }
               case GetShufflePushMergersMessage(shuffleId, context) =>
                 logDebug(s"Handling request to send shuffle push merger locations for shuffle" +
                   s" $shuffleId to ${context.senderAddress.hostPort}")

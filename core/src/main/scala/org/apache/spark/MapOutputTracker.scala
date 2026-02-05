@@ -372,20 +372,35 @@ private class ShuffleStatus(
    * up subsequent requests. If the cache is empty and multiple threads concurrently attempt to
    * serialize the map statuses then serialization will only be performed in a single thread and
    * all other threads will block until the cache is populated.
+   *
+   * @param shuffleId the shuffle id (used for validation error message)
+   * @param startMapIndex the start map index for validation (inclusive)
+   * @param endMapIndex the end map index for validation (exclusive)
+   * @param allowPartial if true, skip validation
+   * @throws MetadataFetchFailedException if validation is enabled and any required map output
+   *                                      is missing
    */
   def serializedMapStatus(
       broadcastManager: BroadcastManager,
       isLocal: Boolean,
       minBroadcastSize: Int,
-      conf: SparkConf): Array[Byte] = {
+      conf: SparkConf,
+      shuffleId: Int = -1,
+      startMapIndex: Int = 0,
+      endMapIndex: Int = Int.MaxValue,
+      allowPartial: Boolean = true): Array[Byte] = {
     var result: Array[Byte] = null
     withReadLock {
+      // Validate before returning cached or serializing new data
+      validateAllMapStatusesAvailable(shuffleId, startMapIndex, endMapIndex, allowPartial)
       if (cachedSerializedMapStatus != null) {
         result = cachedSerializedMapStatus
       }
     }
 
     if (result == null) withWriteLock {
+      // Re-validate under write lock in case state changed
+      validateAllMapStatusesAvailable(shuffleId, startMapIndex, endMapIndex, allowPartial)
       if (cachedSerializedMapStatus == null) {
         val serResult = MapOutputTracker.serializeOutputStatuses[MapStatus](
           mapStatuses, broadcastManager, isLocal, minBroadcastSize, conf)
@@ -400,6 +415,31 @@ private class ShuffleStatus(
   }
 
   /**
+   * Internal validation helper called under lock. Validates that all map outputs are available
+   * when all partitions are requested.
+   */
+  private def validateAllMapStatusesAvailable(
+      shuffleId: Int,
+      startMapIndex: Int,
+      endMapIndex: Int,
+      allowPartial: Boolean): Unit = {
+    if (allowPartial) {
+      return
+    }
+    // TODO: Support range validation for cases where startMapIndex != 0 or
+    // endMapIndex != Int.MaxValue. Currently we only validate when all partitions
+    // are requested, and defer range validation to client-side.
+    if (startMapIndex != 0 || endMapIndex != Int.MaxValue) {
+      return
+    }
+    if (_numAvailableMapOutputs < numPartitions) {
+      throw new MetadataFetchFailedException(shuffleId, -1,
+        s"Missing map outputs for shuffle $shuffleId: " +
+          s"expected $numPartitions, available $_numAvailableMapOutputs")
+    }
+  }
+
+  /**
    * Serializes the mapStatuses and mergeStatuses array into an efficient compressed format.
    * See the comments on `MapOutputTracker.serializeOutputStatuses()` for more details
    * on the serialization format.
@@ -408,14 +448,26 @@ private class ShuffleStatus(
    * up subsequent requests. If the cache is empty and multiple threads concurrently attempt to
    * serialize the statuses array then serialization will only be performed in a single thread and
    * all other threads will block until the cache is populated.
+   *
+   * @param shuffleId the shuffle id (used for validation error message)
+   * @param startMapIndex the start map index for validation (inclusive)
+   * @param endMapIndex the end map index for validation (exclusive)
+   * @param allowPartial if true, skip validation
+   * @throws MetadataFetchFailedException if validation is enabled and any required map output
+   *                                      is missing
    */
   def serializedMapAndMergeStatus(
       broadcastManager: BroadcastManager,
       isLocal: Boolean,
       minBroadcastSize: Int,
-      conf: SparkConf): (Array[Byte], Array[Byte]) = {
+      conf: SparkConf,
+      shuffleId: Int = -1,
+      startMapIndex: Int = 0,
+      endMapIndex: Int = Int.MaxValue,
+      allowPartial: Boolean = true): (Array[Byte], Array[Byte]) = {
     val mapStatusesBytes: Array[Byte] =
-      serializedMapStatus(broadcastManager, isLocal, minBroadcastSize, conf)
+      serializedMapStatus(broadcastManager, isLocal, minBroadcastSize, conf,
+        shuffleId, startMapIndex, endMapIndex, allowPartial)
     var mergeStatusesBytes: Array[Byte] = null
 
     withReadLock {
@@ -806,47 +858,6 @@ private[spark] class MapOutputTrackerMaster(
 
   /** Message loop used for dispatching messages. */
   private class MessageLoop extends Runnable {
-    /**
-     * Validates that all required map output statuses are available.
-     * Currently only validates when all partitions are requested (startMapIndex == 0 and
-     * endMapIndex == Int.MaxValue). For range queries and bitmap-based fallback paths,
-     * validation is skipped and deferred to client-side.
-     *
-     * @param shuffleId the shuffle id
-     * @param startMapIndex the start map index (inclusive)
-     * @param endMapIndex the end map index (exclusive)
-     * @param allowPartial if true, skip validation
-     * @param shuffleStatus the shuffle status to validate
-     * @throws MetadataFetchFailedException if any required map output is missing
-     */
-    private def validateMapStatuses(
-        shuffleId: Int,
-        startMapIndex: Int,
-        endMapIndex: Int,
-        allowPartial: Boolean,
-        shuffleStatus: ShuffleStatus): Unit = {
-      if (allowPartial) {
-        // For bitmap-based fallback paths (getMapSizesForMergeResult), we skip
-        // server-side validation because the required map indexes are determined by
-        // the MergeStatus tracker bitmap which is only known after deserialization.
-        return
-      }
-      // TODO: Support range validation for cases where startMapIndex != 0 or
-      // endMapIndex != Int.MaxValue. Currently we only validate when all partitions
-      // are requested, and defer range validation to client-side.
-      if (startMapIndex != 0 || endMapIndex != Int.MaxValue) {
-        return
-      }
-      // Use counter-based validation for efficiency instead of iterating through all statuses
-      val numPartitions = shuffleStatus.mapStatuses.length
-      val numAvailable = shuffleStatus.numAvailableMapOutputs
-      if (numAvailable < numPartitions) {
-        throw new MetadataFetchFailedException(shuffleId, -1,
-          s"Missing map outputs for shuffle $shuffleId: " +
-            s"expected $numPartitions, available $numAvailable")
-      }
-    }
-
     private def handleStatusMessage(
         shuffleId: Int,
         startMapIndex: Int,
@@ -859,16 +870,15 @@ private[spark] class MapOutputTrackerMaster(
       logDebug(s"Handling request to send ${if (needMergeOutput) "map/merge" else "map"}" +
         s" output locations for shuffle $shuffleId to $hostPort")
 
-      // Validate required map output statuses before serialization
-      validateMapStatuses(shuffleId, startMapIndex, endMapIndex, allowPartial, shuffleStatus)
-
+      // Validation is performed inside serialization methods under the same lock
       if (needMergeOutput) {
         context.reply(
-          shuffleStatus.
-            serializedMapAndMergeStatus(broadcastManager, isLocal, minSizeForBroadcast, conf))
+          shuffleStatus.serializedMapAndMergeStatus(broadcastManager, isLocal, minSizeForBroadcast,
+            conf, shuffleId, startMapIndex, endMapIndex, allowPartial))
       } else {
         context.reply(
-          shuffleStatus.serializedMapStatus(broadcastManager, isLocal, minSizeForBroadcast, conf))
+          shuffleStatus.serializedMapStatus(broadcastManager, isLocal, minSizeForBroadcast,
+            conf, shuffleId, startMapIndex, endMapIndex, allowPartial))
       }
     }
 

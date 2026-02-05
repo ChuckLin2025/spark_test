@@ -808,6 +808,10 @@ private[spark] class MapOutputTrackerMaster(
   private class MessageLoop extends Runnable {
     /**
      * Validates that all required map output statuses are available.
+     * Currently only validates when all partitions are requested (startMapIndex == 0 and
+     * endMapIndex == Int.MaxValue). For range queries and bitmap-based fallback paths,
+     * validation is skipped and deferred to client-side.
+     *
      * @param shuffleId the shuffle id
      * @param startMapIndex the start map index (inclusive)
      * @param endMapIndex the end map index (exclusive)
@@ -822,22 +826,24 @@ private[spark] class MapOutputTrackerMaster(
         allowPartial: Boolean,
         shuffleStatus: ShuffleStatus): Unit = {
       if (allowPartial) {
-        // TODO: For bitmap-based fallback paths (getMapSizesForMergeResult), we skip
+        // For bitmap-based fallback paths (getMapSizesForMergeResult), we skip
         // server-side validation because the required map indexes are determined by
         // the MergeStatus tracker bitmap which is only known after deserialization.
-        // Consider passing the required indexes explicitly in a future optimization.
         return
       }
-      shuffleStatus.withMapStatuses { mapStatuses =>
-        val actualEndMapIndex = if (endMapIndex == Int.MaxValue) mapStatuses.length else endMapIndex
-        var i = startMapIndex
-        while (i < actualEndMapIndex) {
-          if (mapStatuses(i) == null) {
-            throw new MetadataFetchFailedException(shuffleId, -1,
-              s"Missing an output location for shuffle $shuffleId map index $i")
-          }
-          i += 1
-        }
+      // TODO: Support range validation for cases where startMapIndex != 0 or
+      // endMapIndex != Int.MaxValue. Currently we only validate when all partitions
+      // are requested, and defer range validation to client-side.
+      if (startMapIndex != 0 || endMapIndex != Int.MaxValue) {
+        return
+      }
+      // Use counter-based validation for efficiency instead of iterating through all statuses
+      val numPartitions = shuffleStatus.mapStatuses.length
+      val numAvailable = shuffleStatus.numAvailableMapOutputs
+      if (numAvailable < numPartitions) {
+        throw new MetadataFetchFailedException(shuffleId, -1,
+          s"Missing map outputs for shuffle $shuffleId: " +
+            s"expected $numPartitions, available $numAvailable")
       }
     }
 

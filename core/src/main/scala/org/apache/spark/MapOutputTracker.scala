@@ -494,19 +494,49 @@ private class ShuffleStatus(
 }
 
 private[spark] sealed trait MapOutputTrackerMessage
-private[spark] case class GetMapOutputStatuses(shuffleId: Int)
+/**
+ * Request map output statuses for a shuffle.
+ * @param shuffleId the shuffle id
+ * @param startMapIndex the start map index (inclusive) for validation, 0 means from beginning
+ * @param endMapIndex the end map index (exclusive) for validation, Int.MaxValue means all
+ * @param allowPartial if true, skip server-side validation (for bitmap-based fallback paths)
+ */
+private[spark] case class GetMapOutputStatuses(
+    shuffleId: Int,
+    startMapIndex: Int = 0,
+    endMapIndex: Int = Int.MaxValue,
+    allowPartial: Boolean = false)
   extends MapOutputTrackerMessage
-private[spark] case class GetMapAndMergeResultStatuses(shuffleId: Int)
+/**
+ * Request map and merge output statuses for a shuffle.
+ * @param shuffleId the shuffle id
+ * @param startMapIndex the start map index (inclusive) for validation, 0 means from beginning
+ * @param endMapIndex the end map index (exclusive) for validation, Int.MaxValue means all
+ * @param allowPartial if true, skip server-side validation (for bitmap-based fallback paths)
+ */
+private[spark] case class GetMapAndMergeResultStatuses(
+    shuffleId: Int,
+    startMapIndex: Int = 0,
+    endMapIndex: Int = Int.MaxValue,
+    allowPartial: Boolean = false)
   extends MapOutputTrackerMessage
 private[spark] case class GetShufflePushMergerLocations(shuffleId: Int)
   extends MapOutputTrackerMessage
 private[spark] case object StopMapOutputTracker extends MapOutputTrackerMessage
 
 private[spark] sealed trait MapOutputTrackerMasterMessage
-private[spark] case class GetMapOutputMessage(shuffleId: Int,
-  context: RpcCallContext) extends MapOutputTrackerMasterMessage
-private[spark] case class GetMapAndMergeOutputMessage(shuffleId: Int,
-  context: RpcCallContext) extends MapOutputTrackerMasterMessage
+private[spark] case class GetMapOutputMessage(
+    shuffleId: Int,
+    startMapIndex: Int,
+    endMapIndex: Int,
+    allowPartial: Boolean,
+    context: RpcCallContext) extends MapOutputTrackerMasterMessage
+private[spark] case class GetMapAndMergeOutputMessage(
+    shuffleId: Int,
+    startMapIndex: Int,
+    endMapIndex: Int,
+    allowPartial: Boolean,
+    context: RpcCallContext) extends MapOutputTrackerMasterMessage
 private[spark] case class GetShufflePushMergersMessage(shuffleId: Int,
   context: RpcCallContext) extends MapOutputTrackerMasterMessage
 private[spark] case class MapSizesByExecutorId(
@@ -527,13 +557,14 @@ private[spark] class MapOutputTrackerMasterEndpoint(
   }
 
   override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
-    case GetMapOutputStatuses(shuffleId: Int) =>
+    case GetMapOutputStatuses(shuffleId, startMapIndex, endMapIndex, allowPartial) =>
       logInfoMsg(log"map output", shuffleId, context)
-      tracker.post(GetMapOutputMessage(shuffleId, context))
+      tracker.post(GetMapOutputMessage(shuffleId, startMapIndex, endMapIndex, allowPartial, context))
 
-    case GetMapAndMergeResultStatuses(shuffleId: Int) =>
+    case GetMapAndMergeResultStatuses(shuffleId, startMapIndex, endMapIndex, allowPartial) =>
       logInfoMsg(log"map/merge result", shuffleId, context)
-      tracker.post(GetMapAndMergeOutputMessage(shuffleId, context))
+      tracker.post(GetMapAndMergeOutputMessage(
+        shuffleId, startMapIndex, endMapIndex, allowPartial, context))
 
     case GetShufflePushMergerLocations(shuffleId: Int) =>
       logInfoMsg(log"shuffle push merger", shuffleId, context)
@@ -775,14 +806,56 @@ private[spark] class MapOutputTrackerMaster(
 
   /** Message loop used for dispatching messages. */
   private class MessageLoop extends Runnable {
+    /**
+     * Validates that all required map output statuses are available.
+     * @param shuffleId the shuffle id
+     * @param startMapIndex the start map index (inclusive)
+     * @param endMapIndex the end map index (exclusive)
+     * @param allowPartial if true, skip validation
+     * @param shuffleStatus the shuffle status to validate
+     * @throws MetadataFetchFailedException if any required map output is missing
+     */
+    private def validateMapStatuses(
+        shuffleId: Int,
+        startMapIndex: Int,
+        endMapIndex: Int,
+        allowPartial: Boolean,
+        shuffleStatus: ShuffleStatus): Unit = {
+      if (allowPartial) {
+        // TODO: For bitmap-based fallback paths (getMapSizesForMergeResult), we skip
+        // server-side validation because the required map indexes are determined by
+        // the MergeStatus tracker bitmap which is only known after deserialization.
+        // Consider passing the required indexes explicitly in a future optimization.
+        return
+      }
+      shuffleStatus.withMapStatuses { mapStatuses =>
+        val actualEndMapIndex = if (endMapIndex == Int.MaxValue) mapStatuses.length else endMapIndex
+        var i = startMapIndex
+        while (i < actualEndMapIndex) {
+          if (mapStatuses(i) == null) {
+            throw new MetadataFetchFailedException(shuffleId, -1,
+              s"Missing an output location for shuffle $shuffleId map index $i")
+          }
+          i += 1
+        }
+      }
+    }
+
     private def handleStatusMessage(
         shuffleId: Int,
+        startMapIndex: Int,
+        endMapIndex: Int,
+        allowPartial: Boolean,
         context: RpcCallContext,
         needMergeOutput: Boolean): Unit = {
       val hostPort = context.senderAddress.hostPort
       val shuffleStatus = shuffleStatuses.get(shuffleId).head
       logDebug(s"Handling request to send ${if (needMergeOutput) "map/merge" else "map"}" +
         s" output locations for shuffle $shuffleId to $hostPort")
+
+      // Validate required map output statuses before serialization
+      validateMapStatuses(shuffleId, startMapIndex, endMapIndex, allowPartial, shuffleStatus)
+
       if (needMergeOutput) {
         context.reply(
           shuffleStatus.
@@ -805,10 +878,14 @@ private[spark] class MapOutputTrackerMaster(
             }
 
             data match {
-              case GetMapOutputMessage(shuffleId, context) =>
-                handleStatusMessage(shuffleId, context, false)
-              case GetMapAndMergeOutputMessage(shuffleId, context) =>
-                handleStatusMessage(shuffleId, context, true)
+              case GetMapOutputMessage(shuffleId, startMapIndex, endMapIndex, allowPartial,
+                  context) =>
+                handleStatusMessage(shuffleId, startMapIndex, endMapIndex, allowPartial,
+                  context, needMergeOutput = false)
+              case GetMapAndMergeOutputMessage(shuffleId, startMapIndex, endMapIndex, allowPartial,
+                  context) =>
+                handleStatusMessage(shuffleId, startMapIndex, endMapIndex, allowPartial,
+                  context, needMergeOutput = true)
               case GetShufflePushMergersMessage(shuffleId, context) =>
                 logDebug(s"Handling request to send shuffle push merger locations for shuffle" +
                   s" $shuffleId to ${context.senderAddress.hostPort}")
@@ -826,7 +903,7 @@ private[spark] class MapOutputTrackerMaster(
   }
 
   /** A poison endpoint that indicates MessageLoop should exit its message loop. */
-  private val PoisonPill = GetMapOutputMessage(-99, null)
+  private val PoisonPill = GetMapOutputMessage(-99, 0, Int.MaxValue, allowPartial = true, null)
 
   // Used only in unit tests.
   private[spark] def getNumCachedSerializedBroadcast: Int = {
@@ -1348,7 +1425,9 @@ private[spark] class MapOutputTrackerWorker(conf: SparkConf) extends MapOutputTr
       // In this case, boolean check helps to ensure that the unnecessary
       // mergeStatus won't be fetched, thus mergedOutputStatuses won't be
       // passed to convertMapStatuses. See details in [SPARK-37023].
-      if (useMergeResult) fetchMergeResult else false)
+      canFetchMergeResult = if (useMergeResult) fetchMergeResult else false,
+      startMapIndex = startMapIndex,
+      endMapIndex = endMapIndex)
     try {
       val actualEndMapIndex =
         if (endMapIndex == Int.MaxValue) mapOutputStatuses.length else endMapIndex
@@ -1372,7 +1451,11 @@ private[spark] class MapOutputTrackerWorker(conf: SparkConf) extends MapOutputTr
     logDebug(s"Fetching backup outputs for shuffle $shuffleId, partition $partitionId")
     // Fetch the map statuses and merge statuses again since they might have already been
     // cleared by another task running in the same executor.
-    val (mapOutputStatuses, mergeResultStatuses) = getStatuses(shuffleId, conf, fetchMergeResult)
+    // TODO: For bitmap-based fallback paths, we skip server-side validation because the required
+    // map indexes are determined by the MergeStatus tracker bitmap which is only known after
+    // deserialization. Consider passing the required indexes explicitly in a future optimization.
+    val (mapOutputStatuses, mergeResultStatuses) = getStatuses(shuffleId, conf, fetchMergeResult,
+      allowPartial = true)
     try {
       val mergeStatus = mergeResultStatuses(partitionId)
       // If the original MergeStatus is no longer available, we cannot identify the list of
@@ -1398,7 +1481,11 @@ private[spark] class MapOutputTrackerWorker(conf: SparkConf) extends MapOutputTr
     logDebug(s"Fetching backup outputs for shuffle $shuffleId, partition $partitionId")
     // Fetch the map statuses and merge statuses again since they might have already been
     // cleared by another task running in the same executor.
-    val (mapOutputStatuses, _) = getStatuses(shuffleId, conf, fetchMergeResult)
+    // TODO: For bitmap-based fallback paths, we skip server-side validation because the required
+    // map indexes are determined by the chunkTracker bitmap which is only known at call time.
+    // Consider passing the required indexes explicitly in a future optimization.
+    val (mapOutputStatuses, _) = getStatuses(shuffleId, conf, fetchMergeResult,
+      allowPartial = true)
     try {
       MapOutputTracker.getMapStatusesForMergeStatus(shuffleId, partitionId, mapOutputStatuses,
         chunkTracker)
@@ -1437,11 +1524,21 @@ private[spark] class MapOutputTrackerWorker(conf: SparkConf) extends MapOutputTr
    * on this array when reading it, because on the driver, we may be changing it in place.
    *
    * (It would be nice to remove this restriction in the future.)
+   *
+   * @param shuffleId the shuffle id
+   * @param conf the SparkConf
+   * @param canFetchMergeResult whether to fetch merge results
+   * @param startMapIndex the start map index (inclusive) for server-side validation
+   * @param endMapIndex the end map index (exclusive) for server-side validation
+   * @param allowPartial if true, skip server-side validation (for bitmap-based fallback paths)
    */
   private def getStatuses(
       shuffleId: Int,
       conf: SparkConf,
-      canFetchMergeResult: Boolean): (Array[MapStatus], Array[MergeStatus]) = {
+      canFetchMergeResult: Boolean,
+      startMapIndex: Int = 0,
+      endMapIndex: Int = Int.MaxValue,
+      allowPartial: Boolean = false): (Array[MapStatus], Array[MergeStatus]) = {
     if (canFetchMergeResult) {
       val mapOutputStatuses = mapStatuses.get(shuffleId).orNull
       val mergeOutputStatuses = mergeStatuses.get(shuffleId).orNull
@@ -1457,7 +1554,8 @@ private[spark] class MapOutputTrackerWorker(conf: SparkConf) extends MapOutputTr
             logInfo(log"Doing the fetch; tracker endpoint = " +
               log"${MDC(RPC_ENDPOINT_REF, trackerEndpoint)}")
             val fetchedBytes =
-              askTracker[(Array[Byte], Array[Byte])](GetMapAndMergeResultStatuses(shuffleId))
+              askTracker[(Array[Byte], Array[Byte])](GetMapAndMergeResultStatuses(
+                shuffleId, startMapIndex, endMapIndex, allowPartial))
             try {
               fetchedMapStatuses =
                 MapOutputTracker.deserializeOutputStatuses[MapStatus](fetchedBytes._1, conf)
@@ -1491,7 +1589,8 @@ private[spark] class MapOutputTrackerWorker(conf: SparkConf) extends MapOutputTr
           if (fetchedStatuses == null) {
             logInfo(log"Doing the fetch; tracker endpoint =" +
               log" ${MDC(RPC_ENDPOINT_REF, trackerEndpoint)}")
-            val fetchedBytes = askTracker[Array[Byte]](GetMapOutputStatuses(shuffleId))
+            val fetchedBytes = askTracker[Array[Byte]](GetMapOutputStatuses(
+              shuffleId, startMapIndex, endMapIndex, allowPartial))
             try {
               fetchedStatuses =
                 MapOutputTracker.deserializeOutputStatuses[MapStatus](fetchedBytes, conf)

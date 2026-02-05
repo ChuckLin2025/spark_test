@@ -374,9 +374,7 @@ private class ShuffleStatus(
    * all other threads will block until the cache is populated.
    *
    * @param shuffleId the shuffle id (used for validation error message)
-   * @param startMapIndex the start map index for validation (inclusive)
-   * @param endMapIndex the end map index for validation (exclusive)
-   * @param allowPartial if true, skip validation
+   * @param validationParams parameters for server-side validation
    * @throws MetadataFetchFailedException if validation is enabled and any required map output
    *                                      is missing
    */
@@ -385,14 +383,12 @@ private class ShuffleStatus(
       isLocal: Boolean,
       minBroadcastSize: Int,
       conf: SparkConf,
-      shuffleId: Int = -1,
-      startMapIndex: Int = 0,
-      endMapIndex: Int = Int.MaxValue,
-      allowPartial: Boolean = true): Array[Byte] = {
+      shuffleId: Int,
+      validationParams: ValidationParams): Array[Byte] = {
     var result: Array[Byte] = null
     withReadLock {
       // Validate before returning cached or serializing new data
-      validateAllMapStatusesAvailable(shuffleId, startMapIndex, endMapIndex, allowPartial)
+      validateAllMapStatusesAvailable(shuffleId, validationParams)
       if (cachedSerializedMapStatus != null) {
         result = cachedSerializedMapStatus
       }
@@ -400,7 +396,7 @@ private class ShuffleStatus(
 
     if (result == null) withWriteLock {
       // Re-validate under write lock in case state changed
-      validateAllMapStatusesAvailable(shuffleId, startMapIndex, endMapIndex, allowPartial)
+      validateAllMapStatusesAvailable(shuffleId, validationParams)
       if (cachedSerializedMapStatus == null) {
         val serResult = MapOutputTracker.serializeOutputStatuses[MapStatus](
           mapStatuses, broadcastManager, isLocal, minBroadcastSize, conf)
@@ -420,16 +416,14 @@ private class ShuffleStatus(
    */
   private def validateAllMapStatusesAvailable(
       shuffleId: Int,
-      startMapIndex: Int,
-      endMapIndex: Int,
-      allowPartial: Boolean): Unit = {
-    if (allowPartial) {
+      validationParams: ValidationParams): Unit = {
+    if (validationParams.allowPartial) {
       return
     }
     // TODO: Support range validation for cases where startMapIndex != 0 or
     // endMapIndex != Int.MaxValue. Currently we only validate when all partitions
     // are requested, and defer range validation to client-side.
-    if (startMapIndex != 0 || endMapIndex != Int.MaxValue) {
+    if (validationParams.startMapIndex != 0 || validationParams.endMapIndex != Int.MaxValue) {
       return
     }
     if (_numAvailableMapOutputs < numPartitions) {
@@ -450,9 +444,7 @@ private class ShuffleStatus(
    * all other threads will block until the cache is populated.
    *
    * @param shuffleId the shuffle id (used for validation error message)
-   * @param startMapIndex the start map index for validation (inclusive)
-   * @param endMapIndex the end map index for validation (exclusive)
-   * @param allowPartial if true, skip validation
+   * @param validationParams parameters for server-side validation
    * @throws MetadataFetchFailedException if validation is enabled and any required map output
    *                                      is missing
    */
@@ -461,13 +453,11 @@ private class ShuffleStatus(
       isLocal: Boolean,
       minBroadcastSize: Int,
       conf: SparkConf,
-      shuffleId: Int = -1,
-      startMapIndex: Int = 0,
-      endMapIndex: Int = Int.MaxValue,
-      allowPartial: Boolean = true): (Array[Byte], Array[Byte]) = {
+      shuffleId: Int,
+      validationParams: ValidationParams): (Array[Byte], Array[Byte]) = {
     val mapStatusesBytes: Array[Byte] =
       serializedMapStatus(broadcastManager, isLocal, minBroadcastSize, conf,
-        shuffleId, startMapIndex, endMapIndex, allowPartial)
+        shuffleId, validationParams)
     var mergeStatusesBytes: Array[Byte] = null
 
     withReadLock {
@@ -545,32 +535,67 @@ private class ShuffleStatus(
   }
 }
 
+/**
+ * Parameters for server-side validation of map output statuses.
+ * @param allowPartial if true, skip server-side validation (for bitmap-based fallback paths)
+ * @param startMapIndex the start map index (inclusive) for validation, 0 means from beginning
+ * @param endMapIndex the end map index (exclusive) for validation, Int.MaxValue means all
+ */
+private[spark] case class ValidationParams(
+    allowPartial: Boolean,
+    startMapIndex: Int = 0,
+    endMapIndex: Int = Int.MaxValue)
+
+private[spark] object ValidationParams {
+  /** Default params that skip validation */
+  private[spark] val skipValidation: ValidationParams = ValidationParams(allowPartial = true)
+
+  /**
+   * Creates validation params requiring all partitions to be available.
+   * Server-side validation will fail fast if any map output is missing.
+   */
+  def fullPartitionsRequired: ValidationParams = ValidationParams(allowPartial = false)
+
+  /**
+   * Creates validation params for range-based partition requests.
+   * TODO: Implement server-side range validation. Currently skips validation
+   * and defers to client-side validation.
+   */
+  def rangePartitionsRequired: ValidationParams = {
+    // TODO: Enable server-side validation for range queries once supported
+    skipValidation
+  }
+
+  /**
+   * Creates validation params for bitmap-based fallback paths.
+   * TODO: Implement server-side bitmap validation. Currently skips validation
+   * because the required map indexes are determined by the bitmap which is only
+   * known after deserialization on the client side.
+   */
+  def bitmapRequired: ValidationParams = {
+    // TODO: Consider passing the required indexes explicitly in a future optimization
+    skipValidation
+  }
+}
+
 private[spark] sealed trait MapOutputTrackerMessage
 /**
  * Request map output statuses for a shuffle.
  * @param shuffleId the shuffle id
- * @param startMapIndex the start map index (inclusive) for validation, 0 means from beginning
- * @param endMapIndex the end map index (exclusive) for validation, Int.MaxValue means all
- * @param allowPartial if true, skip server-side validation (for bitmap-based fallback paths)
+ * @param validationParams parameters for server-side validation
  */
 private[spark] case class GetMapOutputStatuses(
     shuffleId: Int,
-    startMapIndex: Int = 0,
-    endMapIndex: Int = Int.MaxValue,
-    allowPartial: Boolean = false)
+    validationParams: ValidationParams)
   extends MapOutputTrackerMessage
 /**
  * Request map and merge output statuses for a shuffle.
  * @param shuffleId the shuffle id
- * @param startMapIndex the start map index (inclusive) for validation, 0 means from beginning
- * @param endMapIndex the end map index (exclusive) for validation, Int.MaxValue means all
- * @param allowPartial if true, skip server-side validation (for bitmap-based fallback paths)
+ * @param validationParams parameters for server-side validation
  */
 private[spark] case class GetMapAndMergeResultStatuses(
     shuffleId: Int,
-    startMapIndex: Int = 0,
-    endMapIndex: Int = Int.MaxValue,
-    allowPartial: Boolean = false)
+    validationParams: ValidationParams)
   extends MapOutputTrackerMessage
 private[spark] case class GetShufflePushMergerLocations(shuffleId: Int)
   extends MapOutputTrackerMessage
@@ -579,15 +604,11 @@ private[spark] case object StopMapOutputTracker extends MapOutputTrackerMessage
 private[spark] sealed trait MapOutputTrackerMasterMessage
 private[spark] case class GetMapOutputMessage(
     shuffleId: Int,
-    startMapIndex: Int,
-    endMapIndex: Int,
-    allowPartial: Boolean,
+    validationParams: ValidationParams,
     context: RpcCallContext) extends MapOutputTrackerMasterMessage
 private[spark] case class GetMapAndMergeOutputMessage(
     shuffleId: Int,
-    startMapIndex: Int,
-    endMapIndex: Int,
-    allowPartial: Boolean,
+    validationParams: ValidationParams,
     context: RpcCallContext) extends MapOutputTrackerMasterMessage
 private[spark] case class GetShufflePushMergersMessage(shuffleId: Int,
   context: RpcCallContext) extends MapOutputTrackerMasterMessage
@@ -609,14 +630,13 @@ private[spark] class MapOutputTrackerMasterEndpoint(
   }
 
   override def receiveAndReply(context: RpcCallContext): PartialFunction[Any, Unit] = {
-    case GetMapOutputStatuses(shuffleId, startMapIndex, endMapIndex, allowPartial) =>
+    case GetMapOutputStatuses(shuffleId, validationParams) =>
       logInfoMsg(log"map output", shuffleId, context)
-      tracker.post(GetMapOutputMessage(shuffleId, startMapIndex, endMapIndex, allowPartial, context))
+      tracker.post(GetMapOutputMessage(shuffleId, validationParams, context))
 
-    case GetMapAndMergeResultStatuses(shuffleId, startMapIndex, endMapIndex, allowPartial) =>
+    case GetMapAndMergeResultStatuses(shuffleId, validationParams) =>
       logInfoMsg(log"map/merge result", shuffleId, context)
-      tracker.post(GetMapAndMergeOutputMessage(
-        shuffleId, startMapIndex, endMapIndex, allowPartial, context))
+      tracker.post(GetMapAndMergeOutputMessage(shuffleId, validationParams, context))
 
     case GetShufflePushMergerLocations(shuffleId: Int) =>
       logInfoMsg(log"shuffle push merger", shuffleId, context)
@@ -860,9 +880,7 @@ private[spark] class MapOutputTrackerMaster(
   private class MessageLoop extends Runnable {
     private def handleStatusMessage(
         shuffleId: Int,
-        startMapIndex: Int,
-        endMapIndex: Int,
-        allowPartial: Boolean,
+        validationParams: ValidationParams,
         context: RpcCallContext,
         needMergeOutput: Boolean): Unit = {
       val hostPort = context.senderAddress.hostPort
@@ -874,11 +892,11 @@ private[spark] class MapOutputTrackerMaster(
       if (needMergeOutput) {
         context.reply(
           shuffleStatus.serializedMapAndMergeStatus(broadcastManager, isLocal, minSizeForBroadcast,
-            conf, shuffleId, startMapIndex, endMapIndex, allowPartial))
+            conf, shuffleId, validationParams))
       } else {
         context.reply(
           shuffleStatus.serializedMapStatus(broadcastManager, isLocal, minSizeForBroadcast,
-            conf, shuffleId, startMapIndex, endMapIndex, allowPartial))
+            conf, shuffleId, validationParams))
       }
     }
 
@@ -894,14 +912,10 @@ private[spark] class MapOutputTrackerMaster(
             }
 
             data match {
-              case GetMapOutputMessage(shuffleId, startMapIndex, endMapIndex, allowPartial,
-                  context) =>
-                handleStatusMessage(shuffleId, startMapIndex, endMapIndex, allowPartial,
-                  context, needMergeOutput = false)
-              case GetMapAndMergeOutputMessage(shuffleId, startMapIndex, endMapIndex, allowPartial,
-                  context) =>
-                handleStatusMessage(shuffleId, startMapIndex, endMapIndex, allowPartial,
-                  context, needMergeOutput = true)
+              case GetMapOutputMessage(shuffleId, validationParams, context) =>
+                handleStatusMessage(shuffleId, validationParams, context, needMergeOutput = false)
+              case GetMapAndMergeOutputMessage(shuffleId, validationParams, context) =>
+                handleStatusMessage(shuffleId, validationParams, context, needMergeOutput = true)
               case GetShufflePushMergersMessage(shuffleId, context) =>
                 logDebug(s"Handling request to send shuffle push merger locations for shuffle" +
                   s" $shuffleId to ${context.senderAddress.hostPort}")
@@ -919,7 +933,7 @@ private[spark] class MapOutputTrackerMaster(
   }
 
   /** A poison endpoint that indicates MessageLoop should exit its message loop. */
-  private val PoisonPill = GetMapOutputMessage(-99, 0, Int.MaxValue, allowPartial = true, null)
+  private val PoisonPill = GetMapOutputMessage(-99, ValidationParams.bitmapRequired, null)
 
   // Used only in unit tests.
   private[spark] def getNumCachedSerializedBroadcast: Int = {
@@ -1434,6 +1448,12 @@ private[spark] class MapOutputTrackerWorker(conf: SparkConf) extends MapOutputTr
       endPartition: Int,
       useMergeResult: Boolean): MapSizesByExecutorId = {
     logDebug(s"Fetching outputs for shuffle $shuffleId")
+    // Enable server-side validation to fail fast if map outputs are incomplete
+    val validationParams = if (startMapIndex == 0 && endMapIndex == Int.MaxValue) {
+      ValidationParams.fullPartitionsRequired
+    } else {
+      ValidationParams.rangePartitionsRequired
+    }
     val (mapOutputStatuses, mergedOutputStatuses) = getStatuses(shuffleId, conf,
       // enableBatchFetch can be set to false during stage retry when the
       // shuffleDependency.isShuffleMergeFinalizedMarked is set to false, and Driver
@@ -1442,10 +1462,7 @@ private[spark] class MapOutputTrackerWorker(conf: SparkConf) extends MapOutputTr
       // mergeStatus won't be fetched, thus mergedOutputStatuses won't be
       // passed to convertMapStatuses. See details in [SPARK-37023].
       canFetchMergeResult = if (useMergeResult) fetchMergeResult else false,
-      startMapIndex = startMapIndex,
-      endMapIndex = endMapIndex,
-      // Enable server-side validation to fail fast if map outputs are incomplete
-      allowPartial = false)
+      validationParams)
     try {
       val actualEndMapIndex =
         if (endMapIndex == Int.MaxValue) mapOutputStatuses.length else endMapIndex
@@ -1469,11 +1486,8 @@ private[spark] class MapOutputTrackerWorker(conf: SparkConf) extends MapOutputTr
     logDebug(s"Fetching backup outputs for shuffle $shuffleId, partition $partitionId")
     // Fetch the map statuses and merge statuses again since they might have already been
     // cleared by another task running in the same executor.
-    // TODO: For bitmap-based fallback paths, we skip server-side validation because the required
-    // map indexes are determined by the MergeStatus tracker bitmap which is only known after
-    // deserialization. Consider passing the required indexes explicitly in a future optimization.
     val (mapOutputStatuses, mergeResultStatuses) = getStatuses(shuffleId, conf, fetchMergeResult,
-      allowPartial = true)
+      ValidationParams.bitmapRequired)
     try {
       val mergeStatus = mergeResultStatuses(partitionId)
       // If the original MergeStatus is no longer available, we cannot identify the list of
@@ -1499,11 +1513,8 @@ private[spark] class MapOutputTrackerWorker(conf: SparkConf) extends MapOutputTr
     logDebug(s"Fetching backup outputs for shuffle $shuffleId, partition $partitionId")
     // Fetch the map statuses and merge statuses again since they might have already been
     // cleared by another task running in the same executor.
-    // TODO: For bitmap-based fallback paths, we skip server-side validation because the required
-    // map indexes are determined by the chunkTracker bitmap which is only known at call time.
-    // Consider passing the required indexes explicitly in a future optimization.
     val (mapOutputStatuses, _) = getStatuses(shuffleId, conf, fetchMergeResult,
-      allowPartial = true)
+      ValidationParams.bitmapRequired)
     try {
       MapOutputTracker.getMapStatusesForMergeStatus(shuffleId, partitionId, mapOutputStatuses,
         chunkTracker)
@@ -1546,17 +1557,13 @@ private[spark] class MapOutputTrackerWorker(conf: SparkConf) extends MapOutputTr
    * @param shuffleId the shuffle id
    * @param conf the SparkConf
    * @param canFetchMergeResult whether to fetch merge results
-   * @param startMapIndex the start map index (inclusive) for server-side validation
-   * @param endMapIndex the end map index (exclusive) for server-side validation
-   * @param allowPartial if true, skip server-side validation (for bitmap-based fallback paths)
+   * @param validationParams parameters for server-side validation
    */
   private def getStatuses(
       shuffleId: Int,
       conf: SparkConf,
       canFetchMergeResult: Boolean,
-      startMapIndex: Int = 0,
-      endMapIndex: Int = Int.MaxValue,
-      allowPartial: Boolean = false): (Array[MapStatus], Array[MergeStatus]) = {
+      validationParams: ValidationParams): (Array[MapStatus], Array[MergeStatus]) = {
     if (canFetchMergeResult) {
       val mapOutputStatuses = mapStatuses.get(shuffleId).orNull
       val mergeOutputStatuses = mergeStatuses.get(shuffleId).orNull
@@ -1573,7 +1580,7 @@ private[spark] class MapOutputTrackerWorker(conf: SparkConf) extends MapOutputTr
               log"${MDC(RPC_ENDPOINT_REF, trackerEndpoint)}")
             val fetchedBytes =
               askTracker[(Array[Byte], Array[Byte])](GetMapAndMergeResultStatuses(
-                shuffleId, startMapIndex, endMapIndex, allowPartial))
+                shuffleId, validationParams))
             try {
               fetchedMapStatuses =
                 MapOutputTracker.deserializeOutputStatuses[MapStatus](fetchedBytes._1, conf)
@@ -1608,7 +1615,7 @@ private[spark] class MapOutputTrackerWorker(conf: SparkConf) extends MapOutputTr
             logInfo(log"Doing the fetch; tracker endpoint =" +
               log" ${MDC(RPC_ENDPOINT_REF, trackerEndpoint)}")
             val fetchedBytes = askTracker[Array[Byte]](GetMapOutputStatuses(
-              shuffleId, startMapIndex, endMapIndex, allowPartial))
+              shuffleId, validationParams))
             try {
               fetchedStatuses =
                 MapOutputTracker.deserializeOutputStatuses[MapStatus](fetchedBytes, conf)

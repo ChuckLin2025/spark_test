@@ -1166,4 +1166,143 @@ class MapOutputTrackerSuite extends SparkFunSuite with LocalSparkContext {
       rpcEnv.shutdown()
     }
   }
+
+  test("ValidationParams helper methods return correct values") {
+    // fullPartitionsRequired should have allowPartial = false
+    val fullParams = ValidationParams.fullPartitionsRequired
+    assert(fullParams.allowPartial === false)
+
+    // rangePartitionsRequired should have allowPartial = true (skip validation for now)
+    val rangeParams = ValidationParams.rangePartitionsRequired
+    assert(rangeParams.allowPartial === true)
+
+    // bitmapRequired should have allowPartial = true (skip validation for now)
+    val bitmapParams = ValidationParams.bitmapRequired
+    assert(bitmapParams.allowPartial === true)
+
+    // skipValidation should have allowPartial = true
+    val skipParams = ValidationParams.skipValidation
+    assert(skipParams.allowPartial === true)
+  }
+
+  test("Server-side validation throws MetadataFetchFailedException when map outputs are missing") {
+    val hostname = "localhost"
+    val rpcEnv = createRpcEnv("spark", hostname, 0, new SecurityManager(conf))
+
+    val masterTracker = newTrackerMaster()
+    masterTracker.trackerEndpoint = rpcEnv.setupEndpoint(MapOutputTracker.ENDPOINT_NAME,
+      new MapOutputTrackerMasterEndpoint(rpcEnv, masterTracker, conf))
+
+    val workerRpcEnv = createRpcEnv("spark-worker", hostname, 0, new SecurityManager(conf))
+    val workerTracker = new MapOutputTrackerWorker(conf)
+    workerTracker.trackerEndpoint =
+      workerRpcEnv.setupEndpointRef(rpcEnv.address, MapOutputTracker.ENDPOINT_NAME)
+
+    // Register shuffle with 4 partitions but only register 2 map outputs
+    masterTracker.registerShuffle(10, 4, MergeStatus.SHUFFLE_PUSH_DUMMY_NUM_REDUCES)
+    workerTracker.updateEpoch(masterTracker.getEpoch)
+
+    val blockMgrId = BlockManagerId("a", "hostA", 1000)
+    masterTracker.registerMapOutput(10, 0, MapStatus(blockMgrId, Array(1000L), 0))
+    masterTracker.registerMapOutput(10, 1, MapStatus(blockMgrId, Array(1000L), 1))
+    // Partitions 2 and 3 are missing
+
+    workerTracker.updateEpoch(masterTracker.getEpoch)
+
+    // This should throw FetchFailedException because 2 out of 4 map outputs are missing
+    // and server-side validation is enabled by default for full partition requests
+    val exception = intercept[FetchFailedException] {
+      workerTracker.getMapSizesByExecutorId(10, 0)
+    }
+    assert(exception.getMessage.contains("Missing map outputs"))
+
+    masterTracker.stop()
+    workerTracker.stop()
+    rpcEnv.shutdown()
+    workerRpcEnv.shutdown()
+  }
+
+  test("Server-side validation succeeds when all map outputs are available") {
+    val hostname = "localhost"
+    val rpcEnv = createRpcEnv("spark", hostname, 0, new SecurityManager(conf))
+
+    val masterTracker = newTrackerMaster()
+    masterTracker.trackerEndpoint = rpcEnv.setupEndpoint(MapOutputTracker.ENDPOINT_NAME,
+      new MapOutputTrackerMasterEndpoint(rpcEnv, masterTracker, conf))
+
+    val workerRpcEnv = createRpcEnv("spark-worker", hostname, 0, new SecurityManager(conf))
+    val workerTracker = new MapOutputTrackerWorker(conf)
+    workerTracker.trackerEndpoint =
+      workerRpcEnv.setupEndpointRef(rpcEnv.address, MapOutputTracker.ENDPOINT_NAME)
+
+    // Register shuffle with 2 partitions and register all map outputs
+    masterTracker.registerShuffle(10, 2, MergeStatus.SHUFFLE_PUSH_DUMMY_NUM_REDUCES)
+    workerTracker.updateEpoch(masterTracker.getEpoch)
+
+    val blockMgrId = BlockManagerId("a", "hostA", 1000)
+    masterTracker.registerMapOutput(10, 0, MapStatus(blockMgrId, Array(1000L), 0))
+    masterTracker.registerMapOutput(10, 1, MapStatus(blockMgrId, Array(1000L), 1))
+
+    workerTracker.updateEpoch(masterTracker.getEpoch)
+
+    // This should succeed because all map outputs are available
+    val size1000 = MapStatus.decompressSize(MapStatus.compressSize(1000L))
+    val result = workerTracker.getMapSizesByExecutorId(10, 0)
+    assert(result.nonEmpty)
+    assert(result.toSeq === Seq((blockMgrId,
+      ArrayBuffer((ShuffleBlockId(10, 0, 0), size1000, 0),
+        (ShuffleBlockId(10, 1, 0), size1000, 1)))))
+
+    masterTracker.stop()
+    workerTracker.stop()
+    rpcEnv.shutdown()
+    workerRpcEnv.shutdown()
+  }
+
+  test("Server-side validation is skipped for range partition requests") {
+    val hostname = "localhost"
+    val rpcEnv = createRpcEnv("spark", hostname, 0, new SecurityManager(conf))
+
+    val masterTracker = newTrackerMaster()
+    masterTracker.trackerEndpoint = rpcEnv.setupEndpoint(MapOutputTracker.ENDPOINT_NAME,
+      new MapOutputTrackerMasterEndpoint(rpcEnv, masterTracker, conf))
+
+    val workerRpcEnv = createRpcEnv("spark-worker", hostname, 0, new SecurityManager(conf))
+    val workerTracker = new MapOutputTrackerWorker(conf)
+    workerTracker.trackerEndpoint =
+      workerRpcEnv.setupEndpointRef(rpcEnv.address, MapOutputTracker.ENDPOINT_NAME)
+
+    // Register shuffle with 4 partitions but only register 2 map outputs
+    masterTracker.registerShuffle(10, 4, MergeStatus.SHUFFLE_PUSH_DUMMY_NUM_REDUCES)
+    workerTracker.updateEpoch(masterTracker.getEpoch)
+
+    val blockMgrId = BlockManagerId("a", "hostA", 1000)
+    masterTracker.registerMapOutput(10, 0, MapStatus(blockMgrId, Array(1000L), 0))
+    masterTracker.registerMapOutput(10, 1, MapStatus(blockMgrId, Array(1000L), 1))
+    // Partitions 2 and 3 are missing
+
+    workerTracker.updateEpoch(masterTracker.getEpoch)
+
+    // Range request (startMapIndex=0, endMapIndex=2) should skip server-side validation
+    // and succeed even though not all map outputs are registered
+    val size1000 = MapStatus.decompressSize(MapStatus.compressSize(1000L))
+    val result = workerTracker.getMapSizesByExecutorId(10, 0, 2, 0, 1)
+    assert(result.toSeq === Seq((blockMgrId,
+      ArrayBuffer((ShuffleBlockId(10, 0, 0), size1000, 0),
+        (ShuffleBlockId(10, 1, 0), size1000, 1)))))
+
+    // However, when requesting a range that includes missing partitions (2 and 3),
+    // client-side validation should still throw FetchFailedException
+    val exception = intercept[FetchFailedException] {
+      // Request range startMapIndex=2, endMapIndex=4 which includes missing partitions
+      workerTracker.getMapSizesByExecutorId(10, 2, 4, 0, 1)
+    }
+    // Client-side validation catches the null MapStatus and throws FetchFailedException
+    assert(exception.getMessage.contains("Missing an output location for shuffle 10"))
+
+    masterTracker.stop()
+    workerTracker.stop()
+    rpcEnv.shutdown()
+    workerRpcEnv.shutdown()
+  }
 }

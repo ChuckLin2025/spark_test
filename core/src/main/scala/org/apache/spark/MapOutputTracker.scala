@@ -420,12 +420,6 @@ private class ShuffleStatus(
     if (validationParams.allowPartial) {
       return
     }
-    // TODO: Support range validation for cases where startMapIndex != 0 or
-    // endMapIndex != Int.MaxValue. Currently we only validate when all partitions
-    // are requested, and defer range validation to client-side.
-    if (validationParams.startMapIndex != 0 || validationParams.endMapIndex != Int.MaxValue) {
-      return
-    }
     if (_numAvailableMapOutputs < numPartitions) {
       throw new MetadataFetchFailedException(shuffleId, -1,
         s"Missing map outputs for shuffle $shuffleId: " +
@@ -538,13 +532,8 @@ private class ShuffleStatus(
 /**
  * Parameters for server-side validation of map output statuses.
  * @param allowPartial if true, skip server-side validation (for bitmap-based fallback paths)
- * @param startMapIndex the start map index (inclusive) for validation, 0 means from beginning
- * @param endMapIndex the end map index (exclusive) for validation, Int.MaxValue means all
  */
-private[spark] case class ValidationParams(
-    allowPartial: Boolean,
-    startMapIndex: Int = 0,
-    endMapIndex: Int = Int.MaxValue)
+private[spark] case class ValidationParams(allowPartial: Boolean)
 
 private[spark] object ValidationParams {
   /** Default params that skip validation */

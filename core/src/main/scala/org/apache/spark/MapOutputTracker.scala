@@ -1443,7 +1443,9 @@ private[spark] class MapOutputTrackerWorker(conf: SparkConf) extends MapOutputTr
       // passed to convertMapStatuses. See details in [SPARK-37023].
       canFetchMergeResult = if (useMergeResult) fetchMergeResult else false,
       startMapIndex = startMapIndex,
-      endMapIndex = endMapIndex)
+      endMapIndex = endMapIndex,
+      // Enable server-side validation to fail fast if map outputs are incomplete
+      allowPartial = false)
     try {
       val actualEndMapIndex =
         if (endMapIndex == Int.MaxValue) mapOutputStatuses.length else endMapIndex
